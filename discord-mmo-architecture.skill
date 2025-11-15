@@ -1,0 +1,536 @@
+# Discord MMO Architecture Skill
+
+## Overview
+Complete technical reference for building The Labyrinth MMO - a Discord-integrated browser-based multiplayer game using Phaser.js, Colyseus, and modern web stack.
+
+## When to Use This Skill
+- Setting up multiplayer infrastructure
+- Implementing Discord OAuth authentication
+- Configuring Colyseus rooms and state sync
+- Database design and persistence
+- Deployment and scaling questions
+- Discord bot integration
+- Troubleshooting multiplayer bugs
+
+## Target Specs
+- **Player Capacity**: 50-100 concurrent per room
+- **Platform**: Web browser (Discord accessible)
+- **Timeline**: 3-month MVP, 12-month full launch
+- **Budget**: $5-15/month dev, $25-35/month at 100+ players
+- **Stack**: Node.js + Phaser.js + Colyseus + PostgreSQL/Prisma
+
+---
+
+## Core Architecture
+
+### Tech Stack
+```
+Frontend: Phaser.js v3.70+
+Multiplayer: Colyseus 0.15+
+Server: Node.js + Express v4.19.2
+Database: PostgreSQL + Prisma 6.19.0 (or MongoDB Atlas)
+Auth: Discord OAuth via passport-discord v0.1.4
+Hosting: Railway ($5/mo) + Netlify (free)
+```
+
+### Project Structure
+```
+/labyrinth-game
+  /public           # Phaser.js client
+    index.html
+    game.js
+    /assets
+  server.js         # Colyseus + Express backend
+  /rooms            # Colyseus room definitions
+  /database         # Prisma schema + migrations
+  package.json
+```
+
+---
+
+## Discord OAuth Authentication
+
+### Required Packages
+```bash
+npm install passport@0.7.0 passport-discord@0.1.4 express-session@1.18.2 connect-mongo@5.1.0
+```
+
+### Setup Flow
+1. Create Discord application at discord.com/developers
+2. Get Client ID + Secret
+3. Set redirect URI (must match exactly: protocol, domain, port, path)
+4. Configure passport-discord strategy in `config/passport.js`
+
+### Critical Security Patterns
+- **Never** store tokens in localStorage (XSS vulnerable)
+- **Always** use httpOnly session cookies
+- **Enable** secure: true in production (HTTPS)
+- **Set** sameSite: 'lax' for CSRF protection
+- **Implement** state parameter validation to prevent CSRF
+
+### Common Pitfalls
+- `redirect_uri_mismatch`: URI must EXACTLY match Discord app settings
+- Sessions not persisting: CORS needs `credentials: true` + specific origin
+- "Invalid OAuth2 State": Missing CSRF state validation
+- Rate limit endpoints: 5 attempts per 15 min with express-rate-limit
+
+### Database Schema
+```javascript
+// User model (PostgreSQL/Prisma example)
+model User {
+  id          Int      @id @default(autoincrement())
+  discordId   String   @unique  // Never changes, perfect identifier
+  username    String
+  avatar      String?
+  email       String?
+  characters  Character[]
+  createdAt   DateTime @default(now())
+}
+
+model Character {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  level     Int      @default(1)
+  positionX Float
+  positionY Float
+  inventory Json     // JSONB for flexible data
+  version   Int      @default(1)  // Optimistic locking
+}
+```
+
+---
+
+## Colyseus Multiplayer
+
+### Core Concepts
+- **Authoritative Server**: Server owns game state, clients render it
+- **Delta Compression**: Only changed properties sync (every 50ms default)
+- **Room Pattern**: 50-100 players per room, scale horizontally
+- **Schema Sync**: Decorated classes auto-sync to clients
+
+### Room Setup
+```typescript
+import { Room } from "@colyseus/core";
+import { MapSchema, Schema, type } from "@colyseus/schema";
+
+class Player extends Schema {
+  @type("number") x: number;
+  @type("number") y: number;
+  @type("string") username: string;
+}
+
+class GameState extends Schema {
+  @type({ map: Player }) players = new MapSchema<Player>();
+}
+
+export class GameRoom extends Room<GameState> {
+  onCreate(options: any) {
+    this.setState(new GameState());
+    
+    this.onMessage("move", (client, data) => {
+      const player = this.state.players.get(client.sessionId);
+      if (player) {
+        // VALIDATE input (never trust client)
+        player.x = Math.max(0, Math.min(800, data.x));
+        player.y = Math.max(0, Math.min(600, data.y));
+      }
+    });
+    
+    this.setSimulationInterval((deltaTime) => this.update(deltaTime), 16.6); // 60fps
+    this.setPatchRate(50); // Send updates every 50ms
+  }
+  
+  onJoin(client, options) {
+    const player = new Player();
+    player.x = 400;
+    player.y = 300;
+    player.username = options.username;
+    this.state.players.set(client.sessionId, player);
+  }
+  
+  onLeave(client) {
+    this.state.players.delete(client.sessionId);
+  }
+}
+```
+
+### TypeScript Config (MANDATORY)
+```json
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false  // Critical for Colyseus
+  }
+}
+```
+
+### Critical Rules
+1. **NEVER reassign `this.state`** - breaks change tracking
+2. **Mutate existing state**: `this.state.players.set()`, `player.x = newX`
+3. **Register handlers in onCreate**, not onJoin
+4. **Validate all messages** - third param to onMessage
+5. **Keep state minimal** - only sync gameplay-critical data
+6. **Schema field order must match** between server/client
+
+### Common Bugs
+- Message handlers in onJoin → missed messages (put in onCreate)
+- Sending input every frame (60/sec) → throttle to 10-15/sec max
+- No validation → malicious input crashes server
+- Schema field mismatch → state sync breaks with cryptic errors
+- Exceeding 64 fields per Schema → use nested structures
+
+### Zone-Based Scaling (100+ players)
+```
+Divide world into grid zones (e.g. 10,000 units each)
+Each zone = separate Colyseus room
+Client joins 3x3 grid around position
+On zone boundary cross: leave old rooms, join new ones
+Result: 50-100 per room, thousands across world
+```
+
+### Client Integration (Phaser)
+```javascript
+import Colyseus from "colyseus.js";
+
+const client = new Colyseus.Client("ws://localhost:2567");
+const room = await client.joinOrCreate("game_room", { username: "Player1" });
+
+// Listen for new players
+room.state.players.onAdd = (player, sessionId) => {
+  const sprite = this.add.sprite(player.x, player.y, 'player');
+  playerSprites.set(sessionId, sprite);
+  
+  player.onChange = () => {
+    sprite.x = player.x;
+    sprite.y = player.y;
+  };
+};
+
+// Listen for players leaving
+room.state.players.onRemove = (player, sessionId) => {
+  const sprite = playerSprites.get(sessionId);
+  sprite.destroy();
+  playerSprites.delete(sessionId);
+};
+
+// Send movement
+room.send("move", { x: newX, y: newY });
+```
+
+---
+
+## Database & Persistence
+
+### Why PostgreSQL + Prisma
+- **JSONB support**: Flexible inventory/skills data alongside typed fields
+- **ACID guarantees**: Prevents item duplication bugs
+- **Type safety**: Prisma generates TypeScript types
+- **Migration system**: Safe schema evolution
+
+### Connection Setup
+```javascript
+// lib/prisma.js - SINGLETON pattern
+import { PrismaClient } from '@prisma/client';
+
+const prisma = global.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
+
+export default prisma;
+```
+
+### Colyseus Integration
+```typescript
+import prisma from './lib/prisma';
+
+export class GameRoom extends Room<GameState> {
+  async onAuth(client, options) {
+    // Validate user exists before room access
+    const user = await prisma.user.findUnique({
+      where: { discordId: options.discordId },
+      include: { characters: true }
+    });
+    
+    if (!user) throw new Error("User not found");
+    return { user, character: user.characters[0] };
+  }
+  
+  onJoin(client, options, auth) {
+    // Load character data into room state
+    const player = new Player();
+    player.x = auth.character.positionX;
+    player.y = auth.character.positionY;
+    this.state.players.set(client.sessionId, player);
+    
+    // Auto-save every 30 seconds
+    this.clock.setInterval(() => this.savePlayerData(client), 30000);
+  }
+  
+  async savePlayerData(client) {
+    const player = this.state.players.get(client.sessionId);
+    await prisma.character.update({
+      where: { id: client.auth.character.id },
+      data: {
+        positionX: player.x,
+        positionY: player.y,
+        version: { increment: 1 }  // Optimistic locking
+      }
+    });
+  }
+}
+```
+
+### Concurrent Write Handling (Optimistic Locking)
+```javascript
+async function updateWithRetry(characterId, updates, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const character = await prisma.character.findUnique({ where: { id: characterId } });
+    
+    try {
+      return await prisma.character.update({
+        where: {
+          id: characterId,
+          version: character.version  // Must match current version
+        },
+        data: {
+          ...updates,
+          version: { increment: 1 }
+        }
+      });
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50 * Math.pow(2, i))); // Exponential backoff
+    }
+  }
+}
+```
+
+### Connection Pooling
+```
+connection_limit=20 for 50-100 concurrent players
+connection_limit=50+ for larger populations
+3.5x faster than opening connections per request
+```
+
+---
+
+## Discord Bot Integration
+
+### Setup
+```bash
+npm install discord.js@14.16+
+```
+
+### Bot Architecture
+- **Separate process** from Colyseus (or same process with PM2)
+- **WebSocket to Discord** gateway (different from game WebSockets)
+- **Communication**: HTTP webhooks, Redis pub/sub, or shared database
+
+### Basic Bot
+```javascript
+const { Client, GatewayIntentBits } = require('discord.js');
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages
+  ]
+});
+
+client.once('ready', () => console.log('Bot ready!'));
+
+// Post game events to Discord
+function announceToDiscord(event) {
+  const channel = client.channels.cache.get(process.env.ANNOUNCEMENTS_CHANNEL);
+  channel.send(`🎉 ${event.playerName} defeated ${event.bossName}!`);
+}
+
+// Handle slash commands
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  
+  if (interaction.commandName === 'daily-reward') {
+    await interaction.deferReply();
+    // Call game server API
+    await fetch('https://your-server.com/api/daily-reward', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discordId: interaction.user.id })
+    });
+    await interaction.editReply('Daily reward claimed!');
+  }
+});
+
+client.login(process.env.DISCORD_BOT_TOKEN);
+```
+
+### Rate Limits
+- **5 requests per second per channel**
+- Batch events when possible
+- Use queue for high-frequency updates
+
+---
+
+## Deployment
+
+### Railway (Server Hosting)
+```
+Cost: $5/mo includes $5 usage credits
+Typical usage: $3-5 for 10-50 concurrent players
+WebSocket support: Native wss:// over HTTPS
+Deploy: Connect GitHub repo, auto-deploy on push
+```
+
+### Netlify (Client Hosting)
+```
+Cost: Free tier - 100GB bandwidth/month
+Build: npm run build
+Deploy: Automatic on git push
+CDN: Global, auto SSL
+```
+
+### Environment Variables
+```bash
+# Development (.env)
+DATABASE_URL=postgresql://localhost:5432/labyrinth
+DISCORD_CLIENT_ID=your_dev_client_id
+DISCORD_REDIRECT_URI=http://localhost:3000/auth/callback
+
+# Production (Railway/Netlify dashboard)
+DATABASE_URL=postgresql://production_url
+DISCORD_CLIENT_ID=your_prod_client_id
+DISCORD_REDIRECT_URI=https://yourgame.com/auth/callback
+```
+
+### Common Deployment Issues
+- WebSocket fails: Use `wss://` when client is HTTPS
+- CORS errors: Set origin to Netlify domain with `credentials: true`
+- Env vars missing: Set in Railway dashboard, don't deploy .env
+- Database timeout: Whitelist 0.0.0.0/0 for Railway's dynamic IPs
+
+---
+
+## Performance & Optimization
+
+### Colyseus State Size
+- **Target**: <50KB per room
+- **Rule**: Only sync gameplay-critical data
+- **Store elsewhere**: Cosmetics, achievements, backstory → database
+
+### Patch Rate Tuning
+```javascript
+// Fast action games
+this.setPatchRate(16.6);  // 60fps
+
+// Standard (default)
+this.setPatchRate(50);    // 20 updates/sec
+
+// Turn-based/strategy
+this.setPatchRate(200);   // 5 updates/sec
+```
+
+### Load Testing
+```bash
+npm install -g @colyseus/loadtest
+colyseus-loadtest http://localhost:2567 --room game_room --numClients 100
+```
+
+### Monitoring
+- Colyseus built-in panel: `/colyseus` route (protect with auth)
+- Railway metrics: CPU, memory, response time
+- PM2 dashboard: Process restarts, logs
+
+---
+
+## Security Checklist
+
+- [ ] Discord tokens in httpOnly cookies only
+- [ ] OAuth state parameter validation
+- [ ] Rate limiting on auth endpoints (5/15min)
+- [ ] Server-side input validation on all messages
+- [ ] Optimistic locking for database writes
+- [ ] Bot token in environment variables (never in code)
+- [ ] Health check endpoint for deployment
+- [ ] CORS configured with specific origins + credentials
+- [ ] Session regeneration after login
+
+---
+
+## Timeline Reference
+
+### Month 1-3: MVP
+- Local dev environment ✅
+- Discord OAuth authentication
+- Basic multiplayer movement
+- Database persistence
+- Deploy to Railway + Netlify
+
+### Month 4-6: Core Loop
+- Zone system (multiple rooms)
+- NPC system
+- Quest system
+- Item collection
+- Discord bot announcements
+
+### Month 7-9: Content
+- Multiple zones with unique art
+- Combat system
+- Social features (parties/guilds)
+- Performance optimization
+
+### Month 10-12: Polish
+- Load testing
+- Security audit
+- Discord slash commands
+- Rich Presence (arRPC)
+- Beta testing
+
+---
+
+## Quick Reference Commands
+
+```bash
+# Start dev server
+npm run dev
+
+# Run migrations
+npx prisma migrate dev
+
+# Generate Prisma client
+npx prisma generate
+
+# Load test
+colyseus-loadtest http://localhost:2567 --room game_room --numClients 50
+
+# PM2 production
+pm2 start ecosystem.config.js
+pm2 logs
+pm2 monit
+```
+
+---
+
+## Troubleshooting Quick Hits
+
+**State not syncing?**
+→ Check schema field order matches server/client
+→ Verify experimentalDecorators: true in tsconfig
+→ Never reassign this.state
+
+**Players not seeing each other?**
+→ Check room.state.players.onAdd callback
+→ Verify WebSocket connection in browser console
+→ Test with multiple browser tabs
+
+**Database race conditions?**
+→ Implement optimistic locking with version column
+→ Use transactions for multi-step operations
+
+**Auth redirect failing?**
+→ Discord app redirect URI must EXACTLY match
+→ Include protocol, domain, port, path
+
+**Performance degrading?**
+→ Check Colyseus state size (<50KB)
+→ Profile with /colyseus monitor
+→ Reduce patch rate or throttle client messages
