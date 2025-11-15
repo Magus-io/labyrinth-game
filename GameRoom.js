@@ -1,6 +1,8 @@
 const { Room } = require('colyseus');
 
 class GameRoom extends Room {
+    maxClients = 16;
+
     onCreate(options) {
         console.log('🌀 GameRoom created!');
         this.state = { players: {} };
@@ -21,30 +23,36 @@ class GameRoom extends Room {
         });
     }
     
-    onJoin(client) {
-        console.log(`✅ Player ${client.sessionId} joined!`);
+    onJoin(client, options) {
+        const name = (options && options.name) ? options.name : "Guest";
+
+        console.log(`✅ Player ${name} (${client.sessionId}) joined!`);
         
         // Add player to state
         this.state.players[client.sessionId] = {
             x: 400,
             y: 300,
-            sessionId: client.sessionId
+            sessionId: client.sessionId,
+            name: name
         };
         
         // Tell EXISTING players about new player
         this.broadcast('playerJoined', {
             sessionId: client.sessionId,
             x: 400,
-            y: 300
+            y: 300,
+            name: name
         }, { except: client });
         
         // Tell NEW player about ALL existing players
         for (let id in this.state.players) {
             if (id !== client.sessionId) {
+                const p = this.state.players[id];
                 client.send('playerJoined', {
                     sessionId: id,
-                    x: this.state.players[id].x,
-                    y: this.state.players[id].y
+                    x: p.x,
+                    y: p.y,
+                    name: p.name || "Guest",
                 });
             }
         }
