@@ -12,12 +12,14 @@
 - `item_crystal.png`
 
 ### `/scenes/`
-**What goes here:** Full background scenes (1920x1080)
+**What goes here:** Full background scenes (1536x1024 native for BR01)
 **File format:** PNG
 **Naming examples:**
 - `scene_forest_ruins_01.png`
 - `scene_catacomb_entrance.png`
 - `scene_starting_area.png`
+
+> BR01 (Mushroom Land) native resolution: **1536×1024**. Keep Phaser scale mode `NONE` and do not stretch the background—render it at native size and center the canvas.
 
 ### `/tilesets/`
 **What goes here:** Tilemap sheets for level building

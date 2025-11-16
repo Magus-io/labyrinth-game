@@ -1,0 +1,9 @@
+{
+  "sceneKey": "BR01",
+  "bg": "BR_BG",
+  "camera": { "static": true },
+  "solids": [],
+  "paths": [],
+  "portals": [],
+  "spawn": { "x": 400, "y": 430 }
+}

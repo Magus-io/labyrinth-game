@@ -1,7 +1,8 @@
 const { Room } = require('colyseus');
 
 class GameRoom extends Room {
-    maxClients = 16;
+    maxClients = 4;
+    autoDispose = true;
 
     onCreate(options) {
         console.log('🌀 GameRoom created!');
@@ -21,6 +22,20 @@ class GameRoom extends Room {
                 }, { except: client });
             }
         });
+
+        this.onMessage("zoneChange", (client, data = {}) => {
+            if (!data.key) { return; }
+            console.log('🔵 zoneChange ←', data);
+            if (this.state.players[client.sessionId]) {
+                this.state.players[client.sessionId].zone = data.key;
+            }
+            const payload = {
+                sessionId: client.sessionId,
+                key: data.key,
+                spawn: data.spawn || null
+            };
+            this.broadcast('zoneChange', payload, { except: client });
+        });
     }
     
     onJoin(client, options) {
@@ -33,7 +48,8 @@ class GameRoom extends Room {
             x: 400,
             y: 300,
             sessionId: client.sessionId,
-            name: name
+            name: name,
+            zone: 'BR01'
         };
         
         // Tell EXISTING players about new player
